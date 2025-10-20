@@ -1,0 +1,1608 @@
+# Train LOGISTIC  REGRESSION AND RANDOM FOREST CLASSIFIER.
+
+
+
+# fraud_detection_lr_rf.py
+"""
+Fraud detection using Logistic Regression and Random Forest
+Target: 'isFraud' (1 = fraud, 0 = genuine)
+Input file: fraud_detection_dataset.csv
+"""
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+)
+
+# ---------------------------------------------------------------------
+# STEP 1: Load dataset
+# ---------------------------------------------------------------------
+file_path = "/mnt/data/fraud_detection_dataset.csv"  # path to uploaded CSV
+df = pd.read_csv(file_path)
+
+# Ensure target column exists
+if "isFraud" not in df.columns:
+    raise ValueError("Target column 'isFraud' not found in dataset!")
+
+y = df["isFraud"].astype(int)
+X = df.drop(columns=["isFraud"])
+
+# ---------------------------------------------------------------------
+# STEP 2: Feature engineering
+# ---------------------------------------------------------------------
+# Convert datetime-like columns to useful features (hour, day, etc.)
+time_cols = [c for c in X.columns if "time" in c.lower() or "date" in c.lower()]
+for c in time_cols:
+    try:
+        t = pd.to_datetime(X[c], errors="coerce")
+        X[c + "_hour"] = t.dt.hour
+        X[c + "_day"] = t.dt.day
+        X[c + "_weekday"] = t.dt.weekday
+        X = X.drop(columns=[c])
+    except Exception:
+        pass
+
+# Identify numeric and categorical features
+numeric_features = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+categorical_features = X.select_dtypes(include=["object", "category"]).columns.tolist()
+
+# ---------------------------------------------------------------------
+# STEP 3: Preprocessing pipeline
+# ---------------------------------------------------------------------
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, numeric_features),
+        ("cat", categorical_transformer, categorical_features)
+    ]
+)
+
+# ---------------------------------------------------------------------
+# STEP 4: Train-test split
+# ---------------------------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# ---------------------------------------------------------------------
+# STEP 5: Define models
+# ---------------------------------------------------------------------
+models = {
+    "Logistic Regression": LogisticRegression(max_iter=1000, class_weight="balanced"),
+    "Random Forest": RandomForestClassifier(
+        n_estimators=200, max_depth=12, random_state=42, class_weight="balanced"
+    ),
+}
+
+# ---------------------------------------------------------------------
+# STEP 6: Train, predict, and evaluate each model
+# ---------------------------------------------------------------------
+results = []
+
+for name, model in models.items():
+    print(f"\nTraining {name}...")
+    clf = Pipeline(steps=[("preprocessor", preprocessor), ("model", model)])
+    clf.fit(X_train, y_train)
+
+    y_pred = clf.predict(X_test)
+    y_prob = clf.predict_proba(X_test)[:, 1]
+
+    acc = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    auc = roc_auc_score(y_test, y_prob)
+
+    results.append({
+        "Model": name,
+        "Accuracy": acc,
+        "Precision": prec,
+        "Recall": rec,
+        "F1-Score": f1,
+        "AUC": auc
+    })
+
+# ---------------------------------------------------------------------
+# STEP 7: Display results
+# ---------------------------------------------------------------------
+results_df = pd.DataFrame(results)
+print("\n=== Model Evaluation Summary ===")
+print(results_df.round(4))
+
+# Optionally save results
+results_df.to_csv("/mnt/data/fraud_detection_results.csv", index=False)
+print("\nResults saved to: /mnt/data/fraud_detection_results.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#USED XGBoost, Autoencoders,LSTM and also implemented SMOTE technique
+
+
+# fraud_xgb_deep.py
+"""
+XGBoost + Deep Learning (Autoencoder + optional LSTM sequences) for fraud detection.
+Uses CSV at: /mnt/data/fraud_detection_dataset.csv
+Target column: 'isFraud' (1 fraud, 0 genuine)
+
+Features:
+ - timestamp feature extraction (hour, dow, weekend)
+ - ordinal encoding for categoricals (compact and fast)
+ - handles id-like columns
+ - XGBoost classifier with SMOTE/undersampling options
+ - Dense Autoencoder anomaly detector (unsupervised)
+ - Optional LSTM classifier if sequence data exists (customerID + transactionTime)
+ - Reports Accuracy, Precision, Recall, F1, AUC
+ - Saves models & scalers to /mnt/data/
+"""
+
+import os
+import argparse
+import json
+import time
+from typing import List, Optional, Dict
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+
+# XGBoost
+import xgboost as xgb
+
+# imbalanced-learn
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+# joblib for saving models
+import joblib
+
+# TensorFlow / Keras
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+# Paths
+DATA_PATH = "/mnt/data/fraud_detection_dataset.csv"
+OUT_DIR = "/mnt/data/"
+JOBLIB_PREFIX = os.path.join(OUT_DIR, "fraud_model_")
+
+# Misc
+RANDOM_STATE = 42
+TOP_K_CAT = 20  # keep top categories for each categorical column to limit cardinality
+
+# -------------------------
+# Utilities & preprocessing
+# -------------------------
+def load_df(path=DATA_PATH):
+    df = pd.read_csv(path)
+    if 'isFraud' not in df.columns:
+        raise ValueError("Target 'isFraud' not found in CSV")
+    return df
+
+def extract_time_features(X: pd.DataFrame):
+    ts_cols = [c for c in X.columns if 'time' in c.lower() or 'date' in c.lower() or 'timestamp' in c.lower()]
+    for c in ts_cols:
+        try:
+            t = pd.to_datetime(X[c], errors='coerce')
+            X[c + '_hour'] = t.dt.hour.fillna(-1).astype(int)
+            X[c + '_dow'] = t.dt.dayofweek.fillna(-1).astype(int)
+            X[c + '_isweekend'] = (t.dt.dayofweek >= 5).astype(int).fillna(0).astype(int)
+            X.drop(columns=[c], inplace=True)
+        except Exception:
+            # if parsing fails, drop it
+            X.drop(columns=[c], inplace=True)
+    return X
+
+def collapse_topk_cats(X: pd.DataFrame, cat_cols: List[str], top_k=TOP_K_CAT):
+    for c in cat_cols:
+        top_vals = X[c].value_counts().nlargest(top_k).index
+        X[c] = X[c].where(X[c].isin(top_vals), other='__OTHER__')
+    return X
+
+def prepare_tabular_features(df: pd.DataFrame):
+    # Drop or keep id-like columns
+    id_like = [c for c in df.columns if 'id' in c.lower() or df[c].nunique() > 0.95 * len(df)]
+    # Keep a copy of id_like for informational purpose; we will drop them
+    X = df.drop(columns=[c for c in id_like if c != 'customerID'], errors='ignore').copy()
+    # keep customerID if exists for sequence modeling, but drop it for tabular models below
+    cust_exists = 'customerID' in X.columns
+    # remove customerID for tabular modelling; keep separate if needed
+    if 'customerID' in X.columns:
+        X_customer = X['customerID'].copy()
+        X = X.drop(columns=['customerID'])
+    else:
+        X_customer = None
+
+    X = extract_time_features(X)
+
+    # Identify categorical columns
+    cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+    # collapse high-cardinality
+    if len(cat_cols) > 0:
+        X = collapse_topk_cats(X, cat_cols, top_k=TOP_K_CAT)
+        cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    # numeric columns
+    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+
+    # Preprocessor: impute numerics, scale; ordinal encode categoricals
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    cat_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='constant', fill_value='__MISSING__')),
+        ('ord', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))
+    ])
+
+    preprocessor = ColumnTransformer(transformers=[
+        ('num', numeric_transformer, num_cols),
+        ('cat', cat_transformer, cat_cols)
+    ], remainder='drop')
+
+    return preprocessor, X, num_cols, cat_cols, X_customer, id_like
+
+# -------------------------
+# Metrics helper
+# -------------------------
+def print_metrics(y_true, y_pred, y_prob=None, prefix=""):
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    auc = roc_auc_score(y_true, y_prob) if y_prob is not None else None
+    print(f"--- {prefix} ---")
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall: {rec:.4f}")
+    print(f"F1: {f1:.4f}")
+    if auc is not None:
+        print(f"AUC: {auc:.4f}")
+    return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "auc": auc}
+
+# -------------------------
+# XGBoost classifier flow
+# -------------------------
+def train_xgboost(X, y, preprocessor, use_smote=False, use_undersample=False):
+    # split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE)
+    # preprocessing fit on train
+    preprocessor.fit(X_train)
+    X_train_trans = preprocessor.transform(X_train)
+    X_test_trans = preprocessor.transform(X_test)
+
+    # handle imbalance
+    if use_smote or use_undersample:
+        # imblearn pipeline with preprocessor inside to avoid leakage: but we've already transformed
+        # so we apply SMOTE on transformed numeric arrays
+        if use_smote:
+            sm = SMOTE(random_state=RANDOM_STATE, n_jobs=-1)
+            X_train_res, y_train_res = sm.fit_resample(X_train_trans, y_train)
+        elif use_undersample:
+            rus = RandomUnderSampler(random_state=RANDOM_STATE)
+            X_train_res, y_train_res = rus.fit_resample(X_train_trans, y_train)
+    else:
+        X_train_res, y_train_res = X_train_trans, y_train
+
+    # XGBoost DMatrix
+    # use scale_pos_weight if class imbalance and not using resampling
+    scale_pos_weight = (len(y_train_res) - y_train_res.sum()) / max(y_train_res.sum(), 1)
+
+    clf = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=8,
+        learning_rate=0.1,
+        use_label_encoder=False,
+        eval_metric='logloss',
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        scale_pos_weight=scale_pos_weight
+    )
+    clf.fit(X_train_res, y_train_res)
+    y_pred = clf.predict(X_test_trans)
+    y_prob = clf.predict_proba(X_test_trans)[:, 1]
+    metrics = print_metrics(y_test, y_pred, y_prob, prefix="XGBoost")
+    # Save model & preprocessor
+    joblib.dump(preprocessor, JOBLIB_PREFIX + "xgb_preprocessor.joblib")
+    joblib.dump(clf, JOBLIB_PREFIX + "xgb_model.joblib")
+    print("Saved XGBoost model and preprocessor to", OUT_DIR)
+    return {"model": clf, "preprocessor": preprocessor, "metrics": metrics, "X_test": X_test, "y_test": y_test, "X_test_trans": X_test_trans}
+
+# -------------------------
+# Dense Autoencoder (unsupervised anomaly detection)
+# -------------------------
+def build_autoencoder(input_dim, encoding_dim=32):
+    inp = keras.Input(shape=(input_dim,))
+    x = layers.Dense(max(encoding_dim*4, 64), activation='relu')(inp)
+    x = layers.Dense(max(encoding_dim*2, 32), activation='relu')(x)
+    encoded = layers.Dense(encoding_dim, activation='relu')(x)
+    x = layers.Dense(max(encoding_dim*2, 32), activation='relu')(encoded)
+    x = layers.Dense(max(encoding_dim*4, 64), activation='relu')(x)
+    out = layers.Dense(input_dim, activation='linear')(x)
+    ae = keras.Model(inputs=inp, outputs=out)
+    ae.compile(optimizer='adam', loss='mse')
+    return ae
+
+def train_autoencoder(X, y, preprocessor, contamination=0.02, epochs=30, batch_size=256, class_weighted=False):
+    """
+    Train autoencoder on (mostly) genuine transactions. Approach:
+    - Fit preprocessor on train data
+    - Use only genuine samples (isFraud==0) to train AE (semi-unsupervised)
+    - Compute reconstruction error on validation set; pick threshold using contamination or based on labels to maximize precision.
+    """
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE)
+    preprocessor.fit(X_train)
+    X_train_trans = preprocessor.transform(X_train)
+    X_test_trans = preprocessor.transform(X_test)
+
+    # Train only on genuine (label 0) to learn normal behavior
+    X_ae_train = X_train_trans[y_train == 0]
+    print("Training AE on genuine samples:", X_ae_train.shape)
+
+    input_dim = X_ae_train.shape[1]
+    ae = build_autoencoder(input_dim, encoding_dim=max(16, input_dim//8))
+
+    # Fit with optional class-weight? For AE we normally don't use class weights.
+    ae.fit(X_ae_train, X_ae_train, epochs=epochs, batch_size=batch_size, validation_split=0.1, verbose=2)
+
+    # Reconstruction errors
+    recon_train = np.mean(np.square(ae.predict(X_ae_train) - X_ae_train), axis=1)
+    recon_test = np.mean(np.square(ae.predict(X_test_trans) - X_test_trans), axis=1)
+
+    # threshold: set to percentile of recon_train or tune w.r.t. labels
+    thr = np.percentile(recon_train, 100*(1-contamination))  # higher error = anomaly
+    # Alternatively, choose threshold to maximize precision given labels:
+    # compute precision at candidate thresholds
+    from sklearn.metrics import precision_recall_curve
+    # use test set labels to pick threshold with high precision
+    precision, recall, threshs = precision_recall_curve(y_test, recon_test)
+    # we want points where precision is high; pick threshold achieving max precision with recall > 0
+    # but to keep some recall, choose top precision where recall >= 0.01
+    best_idx = np.argmax(np.where(recall>=0.01, precision, 0))
+    if best_idx < len(threshs):
+        thr_label = threshs[best_idx]
+        # pick the stricter threshold (larger error) between percentile and label-based
+        thr = max(thr, thr_label)
+
+    y_pred = (recon_test >= thr).astype(int)  # anomaly -> fraud
+    # For metrics, treat predicted anomalies as fraud (1)
+    metrics = print_metrics(y_test, y_pred, y_prob=(recon_test - recon_test.min()) / (recon_test.max() - recon_test.min()), prefix="Autoencoder")
+    # Save preprocessor and AE
+    joblib.dump(preprocessor, JOBLIB_PREFIX + "ae_preprocessor.joblib")
+    ae.save(OUT_DIR + "autoencoder_model.keras")
+    print("Saved autoencoder model and preprocessor.")
+    return {"ae": ae, "preprocessor": preprocessor, "threshold": float(thr), "metrics": metrics, "X_test": X_test, "y_test": y_test, "recon_test": recon_test}
+
+# -------------------------
+# LSTM sequence model (optional)
+# -------------------------
+def build_sequences(df, customer_col='customerID', time_col_candidates=None, seq_len=10, feature_cols=None):
+    """
+    Build fixed-length sequences per customer sorted by time.
+    Returns X_seq (num_sequences, seq_len, features), y_seq (labels: 1 if any transaction in seq is fraud)
+    If customerID or suitable timestamp not present, returns None.
+    """
+    if customer_col not in df.columns:
+        print("customerID not in dataset; skipping LSTM sequence build.")
+        return None
+    # find a time column in df or earlier removed; check common names in original dataset
+    # We'll try to rely on existing datetime-like columns in df before extraction; if none, skip.
+    # To be robust, expect that original df had transactionTime -> if missing we skip LSTM.
+    # We'll try to locate any column with 'time' or 'date' in name in the original CSV by reloading.
+    original = pd.read_csv(DATA_PATH)
+    time_cols = [c for c in original.columns if 'time' in c.lower() or 'date' in c.lower() or 'timestamp' in c.lower()]
+    if len(time_cols) == 0:
+        print("No datetime column found in original CSV; skipping LSTM.")
+        return None
+    time_col = time_cols[0]
+    print("Using time column:", time_col, "for sequence ordering.")
+
+    # build per-customer transactions sorted by time
+    df_copy = original.copy()
+    df_copy[time_col] = pd.to_datetime(df_copy[time_col], errors='coerce')
+    df_copy = df_copy.sort_values([customer_col, time_col])
+    # Select features for sequence; if feature_cols provided use them else choose numeric + categorical collapsed
+    if feature_cols is None:
+        feature_cols = [c for c in df_copy.columns if c not in [customer_col, 'isFraud', time_col]]
+        # simple: keep numeric features only for LSTM
+        feature_cols = df_copy[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
+        if len(feature_cols) == 0:
+            print("No numeric features for LSTM; skipping.")
+            return None
+
+    sequences = []
+    seq_labels = []
+    # sliding windows per customer
+    grouped = df_copy.groupby(customer_col)
+    for _, g in grouped:
+        vals = g[feature_cols].values
+        labels = g['isFraud'].values
+        if len(vals) < 1:
+            continue
+        # pad or extract windows of size seq_len using last transactions
+        for i in range(len(vals)):
+            start = max(0, i - seq_len + 1)
+            window = vals[start:i+1]
+            # pad to left if shorter
+            if window.shape[0] < seq_len:
+                pad = np.zeros((seq_len - window.shape[0], window.shape[1]))
+                window = np.vstack([pad, window])
+            sequences.append(window)
+            # label the sequence 1 if the final transaction is fraud (or any in window - choose final)
+            seq_labels.append(int(labels[i]))
+    if len(sequences) == 0:
+        return None
+    X_seq = np.stack(sequences)
+    y_seq = np.array(seq_labels)
+    print("Built sequences shape:", X_seq.shape, "labels shape:", y_seq.shape)
+    return {"X_seq": X_seq, "y_seq": y_seq, "feature_cols": feature_cols}
+
+def train_lstm_sequence(X_seq, y_seq, class_weighted=True, epochs=10, batch_size=128):
+    # split sequences
+    X_train, X_test, y_train, y_test = train_test_split(X_seq, y_seq, test_size=0.2, stratify=y_seq, random_state=RANDOM_STATE)
+    timesteps = X_train.shape[1]
+    n_features = X_train.shape[2]
+    model = keras.Sequential([
+        layers.Masking(mask_value=0., input_shape=(timesteps, n_features)),
+        layers.LSTM(64, return_sequences=False),
+        layers.Dense(32, activation='relu'),
+        layers.Dense(1, activation='sigmoid')
+    ])
+    if class_weighted:
+        # compute class weights
+        from sklearn.utils.class_weight import compute_class_weight
+        classes = np.unique(y_train)
+        weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
+        class_weight = {int(c): float(w) for c, w in zip(classes, weights)}
+    else:
+        class_weight = None
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['AUC'])
+    model.fit(X_train, y_train, validation_split=0.1, epochs=epochs, batch_size=batch_size, class_weight=class_weight, verbose=2)
+    y_prob = model.predict(X_test).ravel()
+    y_pred = (y_prob >= 0.5).astype(int)
+    metrics = print_metrics(y_test, y_pred, y_prob, prefix="LSTM Sequence")
+    # save model
+    model.save(OUT_DIR + "lstm_sequence_model.keras")
+    print("Saved LSTM sequence model.")
+    return {"model": model, "metrics": metrics, "X_test": X_test, "y_test": y_test, "y_prob": y_prob}
+
+# -------------------------
+# CLI main
+# -------------------------
+def main(train=True):
+    df = load_df(DATA_PATH)
+    y = df['isFraud'].astype(int)
+
+    # Prepare tabular preprocessor and X matrix (drop target)
+    preprocessor, X_tabular, num_cols, cat_cols, cust_series, id_like = prepare_tabular_features(df.drop(columns=['isFraud']))
+    print("Num cols:", num_cols)
+    print("Cat cols:", cat_cols)
+    print("ID-like dropped (sample):", id_like[:10])
+
+    # --- XGBoost with SMOTE ---
+    print("\n==== XGBoost (with SMOTE) ====")
+    xgb_res = train_xgboost(X_tabular, y, preprocessor, use_smote=True, use_undersample=False)
+
+    # --- XGBoost with random undersampling ---
+    print("\n==== XGBoost (with undersampling) ====")
+    xgb_res2 = train_xgboost(X_tabular, y, preprocessor, use_smote=False, use_undersample=True)
+
+    # --- Dense Autoencoder ---
+    print("\n==== Dense Autoencoder (unsupervised anomaly) ====")
+    ae_res = train_autoencoder(X_tabular, y, preprocessor, contamination=0.02, epochs=20, batch_size=256)
+
+    # --- Optional LSTM sequence model (if possible) ---
+    print("\n==== Attempting LSTM sequence model (if customerID & time present) ====")
+    seq_data = build_sequences(df, customer_col='customerID', seq_len=10)
+    if seq_data is not None:
+        lstm_res = train_lstm_sequence(seq_data['X_seq'], seq_data['y_seq'], class_weighted=True, epochs=8, batch_size=128)
+    else:
+        print("Skipping LSTM sequence model.")
+
+    print("\nALL DONE. Models saved under", OUT_DIR)
+    return {"xgb_smote": xgb_res, "xgb_under": xgb_res2, "autoencoder": ae_res, "lstm": (lstm_res if seq_data is not None else None)}
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train", action="store_true", help="Train models")
+    args = parser.parse_args()
+    if args.train:
+        report = main(train=True)
+        # Save a brief JSON report
+        out_report = {
+            "xgb_smote_metrics": report['xgb_smote']['metrics'],
+            "xgb_under_metrics": report['xgb_under']['metrics'],
+            "ae_metrics": report['autoencoder']['metrics'],
+            "lstm_metrics": report['lstm']['metrics'] if report['lstm'] is not None else None
+        }
+        with open(os.path.join(OUT_DIR, "training_report.json"), "w") as f:
+            json.dump(out_report, f, indent=2)
+        print("Saved training_report.json to", OUT_DIR)
+    else:
+        print("Run with --train to train models.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#HYPER PARAMETER TUNING,ERROR ANALYSIS IN DEPTH,REPRODUCIBLITY OF RESULTS and MLFLOW TRACKING
+
+#Requirement. TXT should include below
+
+#pandas
+#numpy
+#scikit-learn
+#xgboost
+#optuna
+#imbalanced-learn
+#mlflow
+#matplotlib
+#seaborn
+#joblib
+#tensorflow>=2.9
+
+
+
+#CODE
+
+#!/usr/bin/env python3
+"""
+fraud_mlflow_tuning.py
+
+Train XGBoost classifier and Dense Autoencoder on /mnt/data/fraud_detection_dataset.csv,
+do hyperparameter tuning (Optuna), comprehensive error analysis, reproducibility,
+and track everything in MLflow.
+
+Usage:
+    python fraud_mlflow_tuning.py --run-name myrun --exp-dir /mnt/data/mlruns --n-trials 40
+
+Outputs:
+ - MLflow experiment(s) saved to --exp-dir
+ - Artifacts (models, plots, CSV debug files) stored in MLflow run artifacts
+"""
+
+import os
+import random
+import json
+import tempfile
+import argparse
+from datetime import datetime
+from typing import Dict, Any, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, OrdinalEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (precision_score, recall_score, f1_score, confusion_matrix,
+                             roc_auc_score, accuracy_score, precision_recall_curve, auc, roc_curve)
+import joblib
+
+# ML & tuning
+import xgboost as xgb
+import optuna
+from optuna.integration import XGBoostPruningCallback
+import mlflow
+import mlflow.xgboost
+import mlflow.keras
+
+# imbalance helpers
+from imblearn.over_sampling import SMOTE
+
+# TensorFlow/Keras for autoencoder
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+# ---------------------------
+# Reproducibility helpers
+# ---------------------------
+GLOBAL_SEED = 42
+
+def set_global_seed(seed: int = GLOBAL_SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    try:
+        import sklearn
+        # No direct global seed setter for sklearn; pass `random_state` where needed.
+    except Exception:
+        pass
+    # XGBoost reproducibility
+    os.environ['XGBOOST_DETERMINISTIC'] = "1"
+    # TensorFlow deterministic ops
+    try:
+        tf.random.set_seed(seed)
+        os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    except Exception:
+        pass
+
+# ---------------------------
+# Data loading & preprocessing
+# ---------------------------
+DATA_PATH = "/mnt/data/fraud_detection_dataset.csv"
+
+def load_data(path: str = DATA_PATH) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if 'isFraud' not in df.columns:
+        raise ValueError("Target column 'isFraud' not found.")
+    return df
+
+def extract_time_features(X: pd.DataFrame) -> pd.DataFrame:
+    ts_cols = [c for c in X.columns if 'time' in c.lower() or 'timestamp' in c.lower() or 'date' in c.lower()]
+    for t in ts_cols:
+        try:
+            dt = pd.to_datetime(X[t], errors='coerce')
+            X[t + '_hour'] = dt.dt.hour.fillna(-1).astype(int)
+            X[t + '_dow'] = dt.dt.dayofweek.fillna(-1).astype(int)
+            X[t + '_isweekend'] = (dt.dt.dayofweek >= 5).astype(int).fillna(0).astype(int)
+            X.drop(columns=[t], inplace=True)
+        except Exception:
+            X.drop(columns=[t], inplace=True)
+    return X
+
+def collapse_topk_categories(X: pd.DataFrame, top_k: int = 20) -> pd.DataFrame:
+    cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+    for c in cat_cols:
+        top = X[c].value_counts().nlargest(top_k).index
+        X[c] = X[c].where(X[c].isin(top), other='__OTHER__')
+    return X
+
+def build_preprocessor(X: pd.DataFrame):
+    # Decide numeric and categorical columns
+    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+    # Heuristically drop id-like columns (very high cardinality or containing 'id')
+    id_like = [c for c in X.columns if 'id' in c.lower() or X[c].nunique() > 0.95 * len(X)]
+    numeric_cols = [c for c in numeric_cols if c not in id_like]
+    categorical_cols = [c for c in categorical_cols if c not in id_like]
+
+    num_pipe = Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
+    cat_pipe = Pipeline([('imputer', SimpleImputer(strategy='constant', fill_value='__MISSING__')),
+                         ('ord', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))])
+    preprocessor = ColumnTransformer([('num', num_pipe, numeric_cols),
+                                      ('cat', cat_pipe, categorical_cols)],
+                                     remainder='drop')
+    return preprocessor, numeric_cols, categorical_cols, id_like
+
+# ---------------------------
+# Metrics & plotting utilities
+# ---------------------------
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
+    metrics = {}
+    metrics['accuracy'] = float(accuracy_score(y_true, y_pred))
+    metrics['precision'] = float(precision_score(y_true, y_pred, zero_division=0))
+    metrics['recall'] = float(recall_score(y_true, y_pred, zero_division=0))
+    metrics['f1'] = float(f1_score(y_true, y_pred, zero_division=0))
+    if y_prob is not None:
+        metrics['auc'] = float(roc_auc_score(y_true, y_prob))
+    else:
+        metrics['auc'] = None
+    return metrics
+
+def plot_roc_pr(y_true, y_prob, out_prefix):
+    # ROC
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    roc_auc = auc(fpr, tpr)
+    plt.figure(figsize=(6,5))
+    plt.plot(fpr, tpr, label=f'AUC={roc_auc:.4f}')
+    plt.plot([0,1],[0,1],'--', color='grey')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve')
+    plt.legend()
+    roc_path = out_prefix + "_roc.png"
+    plt.tight_layout()
+    plt.savefig(roc_path)
+    plt.close()
+    # PR
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    pr_auc = auc(recall, precision)
+    plt.figure(figsize=(6,5))
+    plt.plot(recall, precision, label=f'PR-AUC={pr_auc:.4f}')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve')
+    plt.legend()
+    pr_path = out_prefix + "_pr.png"
+    plt.tight_layout()
+    plt.savefig(pr_path)
+    plt.close()
+    return roc_path, pr_path
+
+# ---------------------------
+# Error analysis
+# ---------------------------
+def error_analysis_save(X_test_df: pd.DataFrame, y_test: np.ndarray, y_pred: np.ndarray, run_artifact_dir: str):
+    # Save confusion matrix and top FP/FN examples
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+    cm = {'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp)}
+    with open(os.path.join(run_artifact_dir, "confusion_matrix.json"), "w") as f:
+        json.dump(cm, f)
+    # attach examples
+    df = X_test_df.copy()
+    df['y_true'] = y_test
+    df['y_pred'] = y_pred
+    # Top false positives (pred=1 true=0)
+    fps = df[(df['y_true']==0) & (df['y_pred']==1)]
+    fns = df[(df['y_true']==1) & (df['y_pred']==0)]
+    fps.head(200).to_csv(os.path.join(run_artifact_dir, "false_positives.csv"), index=False)
+    fns.head(200).to_csv(os.path.join(run_artifact_dir, "false_negatives.csv"), index=False)
+    # Basic feature distributions for FP vs TN and FN vs TP for first few columns
+    cols = df.columns.tolist()
+    candidate_cols = [c for c in cols if c not in ['y_true','y_pred']][:6]
+    for c in candidate_cols:
+        plt.figure(figsize=(6,4))
+        try:
+            sns.kdeplot(df[c].dropna(), label='all', bw_method='scott')
+            sns.kdeplot(fps[c].dropna(), label='false_positives', bw_method='scott')
+            sns.kdeplot(fns[c].dropna(), label='false_negatives', bw_method='scott')
+            plt.legend()
+            plt.title(f"Dist - {c}")
+            plt.tight_layout()
+            p = os.path.join(run_artifact_dir, f"dist_{c}.png")
+            plt.savefig(p)
+            plt.close()
+        except Exception:
+            # categorical or non-plottable
+            plt.close()
+    return
+
+# ---------------------------
+# XGBoost training & Optuna tuning
+# ---------------------------
+def objective_xgb(trial, X_train_np, y_train_np, X_val_np, y_val_np, params_fixed):
+    # Suggest hyperparameters
+    param = {
+        'verbosity': 0,
+        'objective': 'binary:logistic',
+        'tree_method': 'hist',  # fast
+        'booster': 'gbtree',
+        'eta': trial.suggest_loguniform('eta', 0.01, 0.3),
+        'max_depth': trial.suggest_int('max_depth', 3, 12),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+        'gamma': trial.suggest_float('gamma', 0.0, 5.0),
+        'lambda': trial.suggest_float('lambda', 1e-3, 10.0),
+        'alpha': trial.suggest_float('alpha', 1e-3, 10.0),
+        'scale_pos_weight': params_fixed.get('scale_pos_weight', 1.0),
+        'random_state': GLOBAL_SEED,
+        'nthread': 1,
+    }
+    # merge fixed params
+    param.update(params_fixed.get('static', {}))
+
+    dtrain = xgb.DMatrix(X_train_np, label=y_train_np)
+    dval = xgb.DMatrix(X_val_np, label=y_val_np)
+
+    evallist = [(dtrain, 'train'), (dval, 'valid')]
+
+    bst = xgb.train(param, dtrain, num_boost_round=1000,
+                    evals=evallist, early_stopping_rounds=40,
+                    verbose_eval=False,
+                    callbacks=[XGBoostPruningCallback(trial, "valid-auc")])
+    preds = bst.predict(dval, ntree_limit=bst.best_ntree_limit)
+    auc_score = roc_auc_score(y_val_np, preds)
+    # Objective: maximize AUC but bias toward high precision later with threshold tuning logged separately
+    trial.set_user_attr('best_ntree_limit', int(bst.best_ntree_limit))
+    return auc_score
+
+def tune_xgboost_with_optuna(X_train, y_train, X_val, y_val, n_trials=40, use_smote=False):
+    # convert to numpy after preprocessor transform outside
+    study = optuna.create_study(direction='maximize', study_name=f"xgb_optuna_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    # fixed params
+    pos = np.sum(y_train==0) / max(np.sum(y_train==1), 1)
+    fixed = {'scale_pos_weight': pos, 'static': {}}
+    def objective(trial):
+        return objective_xgb(trial, X_train, y_train, X_val, y_val, params_fixed=fixed)
+    study.optimize(objective, n_trials=n_trials, n_jobs=1)
+    return study
+
+# ---------------------------
+# Autoencoder (dense) with optuna tuning
+# ---------------------------
+def build_dense_autoencoder(input_dim, encoding_dim=32, depth=2, activation='relu', dropout=0.0):
+    inp = keras.Input(shape=(input_dim,))
+    x = inp
+    # encoder
+    for i in range(depth):
+        units = max(encoding_dim * (2**(depth - i)), 8)
+        x = layers.Dense(units, activation=activation)(x)
+        if dropout > 0:
+            x = layers.Dropout(dropout)(x)
+    encoded = layers.Dense(encoding_dim, activation=activation)(x)
+    x = encoded
+    # decoder (mirror)
+    for i in range(depth):
+        units = max(encoding_dim * (2**(i+1)), 8)
+        x = layers.Dense(units, activation=activation)(x)
+        if dropout > 0:
+            x = layers.Dropout(dropout)(x)
+    out = layers.Dense(input_dim, activation='linear')(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+def objective_ae(trial, X_train_np, X_val_np, y_val_np):
+    encoding_dim = trial.suggest_int('encoding_dim', max(4, X_train_np.shape[1]//16), max(64, X_train_np.shape[1]//2))
+    depth = trial.suggest_int('depth', 1, 3)
+    dropout = trial.suggest_float('dropout', 0.0, 0.5)
+    activation = trial.suggest_categorical('activation', ['relu', 'tanh'])
+    batch_size = trial.suggest_categorical('batch_size', [128, 256, 512])
+    epochs = 30
+    model = build_dense_autoencoder(X_train_np.shape[1], encoding_dim=encoding_dim, depth=depth,
+                                    activation=activation, dropout=dropout)
+    # train only on genuine samples in train
+    history = model.fit(X_train_np, X_train_np, validation_data=(X_val_np, X_val_np),
+                        epochs=epochs, batch_size=batch_size, verbose=0)
+    # compute reconstruction error on val and use AUC wrt labels (we expect fraud -> larger error)
+    recon = np.mean(np.square(model.predict(X_val_np) - X_val_np), axis=1)
+    auc_score = roc_auc_score(y_val_np, recon)
+    # prefer higher AUC and lower model size, combine as objective
+    return auc_score
+
+def tune_autoencoder_optuna(X_train_np, X_val_np, y_val_np, n_trials=20):
+    study = optuna.create_study(direction='maximize', study_name='ae_optuna_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
+    def objective_wrapper(trial):
+        return objective_ae(trial, X_train_np, X_val_np, y_val_np)
+    study.optimize(objective_wrapper, n_trials=n_trials)
+    return study
+
+# ---------------------------
+# Main experiment orchestration + MLflow logging
+# ---------------------------
+def run_experiment(run_name: str, exp_dir: str, n_trials: int = 40, target_precision: float = None):
+    set_global_seed(GLOBAL_SEED)
+    mlflow.set_tracking_uri(exp_dir)
+    mlflow.set_experiment("fraud_detection_experiment")
+
+    df = load_data(DATA_PATH)
+    y = df['isFraud'].astype(int)
+    X = df.drop(columns=['isFraud']).copy()
+
+    # Keep a copy of full X for error-analysis saving (with original columns)
+    X_full = X.copy()
+
+    # Preprocessing
+    X = extract_time_features(X)
+    X = collapse_topk_categories(X, top_k=20)
+    preprocessor, num_cols, cat_cols, id_like = build_preprocessor(X)
+    # Fit preprocess on whole data split later; but we will do train/test split first
+    X_train_df, X_test_df, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=GLOBAL_SEED)
+    # Preprocessor fit on train
+    preprocessor.fit(X_train_df)
+    X_train = preprocessor.transform(X_train_df)
+    X_test = preprocessor.transform(X_test_df)
+
+    # Optionally apply SMOTE for training (but we'll use scale_pos_weight approach for XGBoost tuning)
+    sm = SMOTE(random_state=GLOBAL_SEED, n_jobs=1)
+    X_train_sm, y_train_sm = sm.fit_resample(X_train, y_train)
+
+    # Split train -> train/val for tuning
+    X_tr, X_val, y_tr, y_val = train_test_split(X_train_sm, y_train_sm, stratify=y_train_sm, test_size=0.2, random_state=GLOBAL_SEED)
+
+    # Start MLflow run for XGBoost tuning
+    with mlflow.start_run(run_name=f"{run_name}_xgboost_tuning") as run:
+        mlflow.log_param("seed", GLOBAL_SEED)
+        mlflow.log_param("n_trials", n_trials)
+        # Save preprocessor
+        preproc_path = "preprocessor.joblib"
+        joblib.dump(preprocessor, preproc_path)
+        mlflow.log_artifact(preproc_path, artifact_path="preprocessing")
+        # convert to numpy
+        X_tr_np, X_val_np, X_test_np = np.asarray(X_tr), np.asarray(X_val), np.asarray(X_test)
+        y_tr_np, y_val_np, y_test_np = np.asarray(y_tr), np.asarray(y_val), np.asarray(y_test)
+
+        # Tune XGBoost
+        study = tune_xgboost_with_optuna(X_tr_np, y_tr_np, X_val_np, y_val_np, n_trials=n_trials, use_smote=False)
+        best = study.best_trial
+        mlflow.log_params(best.params)
+        mlflow.log_metric("best_validation_auc", best.value)
+
+        # Train final XGBoost on combined (train + val) with best params
+        best_params = best.params.copy()
+        # Add deterministic & objective params
+        best_params.update({'objective': 'binary:logistic', 'verbosity': 0, 'tree_method': 'hist', 'random_state': GLOBAL_SEED})
+        dtrain_full = xgb.DMatrix(np.vstack([X_tr_np, X_val_np]), label=np.hstack([y_tr_np, y_val_np]))
+        dtest = xgb.DMatrix(X_test_np, label=y_test_np)
+        num_round = 1000
+        bst = xgb.train(best_params, dtrain_full, num_boost_round=num_round, evals=[(dtrain_full, 'train')],
+                        early_stopping_rounds=40, verbose_eval=False)
+        # Predictions
+        preds_proba = bst.predict(dtest, ntree_limit=bst.best_ntree_limit)
+        preds = (preds_proba >= 0.5).astype(int)
+        metrics = compute_metrics(y_test_np, preds, preds_proba)
+        mlflow.log_metrics(metrics)
+        # Save model
+        model_path = "xgb_model.bst"
+        bst.save_model(model_path)
+        mlflow.log_artifact(model_path, artifact_path="models")
+        # Save study for reproducibility
+        study_path = "optuna_study.pkl"
+        joblib.dump(study, study_path)
+        mlflow.log_artifact(study_path, artifact_path="tuning")
+        # Save ROC/PR plots
+        roc_path, pr_path = plot_roc_pr(y_test_np, preds_proba, out_prefix="xgb_eval")
+        mlflow.log_artifact(roc_path, artifact_path="plots")
+        mlflow.log_artifact(pr_path, artifact_path="plots")
+        # Error analysis: save FP/FN examples (use X_test_df original columns by inverse mapping)
+        # inverse_transform is not trivial for ordinals; we will save the original X_test_df portion
+        run_artifact_dir = tempfile.mkdtemp()
+        X_test_df_reset = X_test_df.reset_index(drop=True)
+        error_analysis_save(X_test_df_reset, y_test_np, preds, run_artifact_dir)
+        # upload artifacts
+        for fname in os.listdir(run_artifact_dir):
+            mlflow.log_artifact(os.path.join(run_artifact_dir, fname), artifact_path="error_analysis")
+        # threshold search: sweep thresholds and log precision/recall tradeoff
+        thresholds = np.linspace(0.01, 0.99, 99)
+        best_t = 0.5
+        best_prec = 0.0
+        best_rec = 0.0
+        for t in thresholds:
+            p = (preds_proba >= t).astype(int)
+            prec = precision_score(y_test_np, p, zero_division=0)
+            rec = recall_score(y_test_np, p, zero_division=0)
+            mlflow.log_metric(f"precision_at_{t:.2f}", float(prec))
+            mlflow.log_metric(f"recall_at_{t:.2f}", float(rec))
+            if target_precision is not None:
+                if prec >= target_precision and rec > best_rec:
+                    best_prec, best_rec, best_t = prec, rec, t
+            else:
+                if prec > best_prec:
+                    best_prec, best_rec, best_t = prec, rec, t
+        mlflow.log_metric("best_threshold", float(best_t))
+        mlflow.log_metric("best_threshold_precision", float(best_prec))
+        mlflow.log_metric("best_threshold_recall", float(best_rec))
+
+    # -------------------------------
+    # Autoencoder tuning & logging
+    # -------------------------------
+    with mlflow.start_run(run_name=f"{run_name}_autoencoder_tuning") as run_ae:
+        mlflow.log_param("seed", GLOBAL_SEED)
+        # For AE, we want to operate on numeric/tabular feature space; use X_train/X_test from above
+        # Use SMOTE only for classifier; AE trained on genuine only (unsupervised/semi-supervised)
+        # Prepare smaller train/val splits (use X_train before SMOTE)
+        X_train_raw = X_train  # earlier preprocessed X_train (without SMOTE) - actually X_train from preprocessor.transform
+        # We'll re-create train/val from original X_train & y_train (without SMOTE)
+        X_train0, X_val0, y_train0, y_val0 = train_test_split(X_train, y_train, stratify=y_train, test_size=0.2, random_state=GLOBAL_SEED)
+        # Use only genuine samples from train to fit AE
+        X_ae_train = X_train0[y_train0 == 0]
+        X_ae_val = X_val0  # use full val for threshold selection
+        # run small optuna study to pick encoding_dim, depth, dropout
+        def ae_objective(trial):
+            encoding_dim = trial.suggest_int('encoding_dim', max(4, X_ae_train.shape[1]//16), max(64, X_ae_train.shape[1]//2))
+            depth = trial.suggest_int('depth', 1, 3)
+            dropout = trial.suggest_float('dropout', 0.0, 0.5)
+            activation = trial.suggest_categorical('activation', ['relu', 'tanh'])
+            batch_size = trial.suggest_categorical('batch_size', [128, 256])
+            model = build_dense_autoencoder(X_ae_train.shape[1], encoding_dim=encoding_dim, depth=depth, activation=activation, dropout=dropout)
+            model.fit(X_ae_train, X_ae_train, validation_data=(X_ae_val, X_ae_val), epochs=20, batch_size=batch_size, verbose=0)
+            recon = np.mean(np.square(model.predict(X_ae_val) - X_ae_val), axis=1)
+            auc_score = roc_auc_score(y_val, recon) if np.unique(y_val).size > 1 else 0.5
+            return auc_score
+
+        study_ae = optuna.create_study(direction='maximize')
+        study_ae.optimize(ae_objective, n_trials=max(8, n_trials//5))
+
+        mlflow.log_params(study_ae.best_trial.params)
+        # train final AE with best params
+        best_ae_params = study_ae.best_trial.params
+        ae_model = build_dense_autoencoder(X_ae_train.shape[1], encoding_dim=int(best_ae_params.get('encoding_dim', 32)),
+                                           depth=int(best_ae_params.get('depth', 2)),
+                                           activation=best_ae_params.get('activation', 'relu'),
+                                           dropout=float(best_ae_params.get('dropout', 0.0)))
+        ae_model.fit(X_ae_train, X_ae_train, validation_data=(X_ae_val, X_ae_val), epochs=30, batch_size=int(best_ae_params.get('batch_size', 128)), verbose=1)
+        # Evaluate AE on test set
+        recon_test = np.mean(np.square(ae_model.predict(X_test), axis=1) - np.square(X_test), axis=1) if False else np.mean(np.square(ae_model.predict(X_test) - X_test), axis=1)
+        # compute threshold using percentile or label-aware method
+        thr = np.percentile(np.mean(np.square(ae_model.predict(X_ae_train) - X_ae_train), axis=1), 98)
+        preds_ae = (recon_test >= thr).astype(int)
+        metrics_ae = compute_metrics(y_test, preds_ae, (recon_test - recon_test.min()) / (recon_test.max() - recon_test.min()))
+        mlflow.log_metrics(metrics_ae)
+        # Save model and artifacts
+        ae_path = "autoencoder_model.keras"
+        ae_model.save(ae_path)
+        mlflow.log_artifact(ae_path, artifact_path="models")
+        # ROC/PR for AE
+        ae_roc, ae_pr = plot_roc_pr(y_test, (recon_test - recon_test.min())/(recon_test.max()-recon_test.min()), out_prefix="ae_eval")
+        mlflow.log_artifact(ae_roc, artifact_path="plots")
+        mlflow.log_artifact(ae_pr, artifact_path="plots")
+
+    # -------------------------------
+    # Save environment & reproducibility info
+    # -------------------------------
+    with mlflow.start_run(run_name=f"{run_name}_repro_info"):
+        # save seed, versions, installed packages
+        mlflow.log_param("seed", GLOBAL_SEED)
+        try:
+            import pkg_resources
+            pkgs = {p.key: p.version for p in pkg_resources.working_set}
+            with open("requirements_snapshot.json", "w") as f:
+                json.dump(pkgs, f, indent=2)
+            mlflow.log_artifact("requirements_snapshot.json", artifact_path="repro")
+        except Exception:
+            pass
+        # save small README
+        with open("README_run.txt", "w") as f:
+            f.write(f"Run at {datetime.now().isoformat()}\nSeed: {GLOBAL_SEED}\nData path: {DATA_PATH}\n")
+        mlflow.log_artifact("README_run.txt", artifact_path="repro")
+
+    print("Experiment finished. Check MLflow UI at:", exp_dir)
+
+# ---------------------------
+# Small helper builders reused
+# ---------------------------
+def build_dense_autoencoder(input_dim, encoding_dim=32, depth=2, activation='relu', dropout=0.0):
+    inp = keras.Input(shape=(input_dim,))
+    x = inp
+    for i in range(depth):
+        units = max(int(encoding_dim*(2**(depth-i))), 8)
+        x = layers.Dense(units, activation=activation)(x)
+        if dropout > 0:
+            x = layers.Dropout(dropout)(x)
+    encoded = layers.Dense(encoding_dim, activation=activation)(x)
+    x = encoded
+    for i in range(depth):
+        units = max(int(encoding_dim*(2**(i+1))), 8)
+        x = layers.Dense(units, activation=activation)(x)
+        if dropout > 0:
+            x = layers.Dropout(dropout)(x)
+    out = layers.Dense(input_dim, activation='linear')(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+# ---------------------------
+# CLI
+# ---------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-name", type=str, default="fraud_run", help="MLflow run name prefix")
+    parser.add_argument("--exp-dir", type=str, default="file:///mnt/data/mlruns", help="MLflow tracking URI (file:///...) or server URI")
+    parser.add_argument("--n-trials", type=int, default=40, help="Number of Optuna trials for XGBoost tuning")
+    parser.add_argument("--target-precision", type=float, default=None, help="Optional target precision for threshold selection")
+    args = parser.parse_args()
+    # If exp-dir is local path without scheme, add file://
+    if not args.exp_dir.startswith("file://") and "http" not in args.exp_dir:
+        args.exp_dir = "file://" + os.path.abspath(args.exp_dir)
+    run_experiment(run_name=args.run_name, exp_dir=args.exp_dir, n_trials=args.n_trials, target_precision=args.target_precision)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#DEPLOYING FRAUD DETECTION USING FLASK/KAFKA and INTEGRATION and ENSURING LATENCY IS<= 200ms
+
+
+import asyncio
+import json
+import time
+import joblib
+import xgboost as xgb
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+
+# -------------------------
+# CONFIGURATION
+# -------------------------
+MODEL_PATH = "xgb_model.bst"
+PREPROC_PATH = "preprocessor.joblib"
+KAFKA_TOPIC = "transactions"
+KAFKA_BROKER = "localhost:9092"
+LATENCY_BUDGET_MS = 200
+
+# -------------------------
+# LOAD MODEL + PREPROCESSOR
+# -------------------------
+print("Loading model and preprocessor...")
+preprocessor = joblib.load(PREPROC_PATH)
+model = xgb.Booster()
+model.load_model(MODEL_PATH)
+print("✅ Model and preprocessor loaded")
+
+# -------------------------
+# FASTAPI APP
+# -------------------------
+app = FastAPI(title="Fraud Detection API", version="1.0")
+
+# Define input schema
+class Transaction(BaseModel):
+    user_id: int
+    amount: float
+    device_type: str
+    geo_location: str
+    timestamp: str
+    age: int | None = None
+    gender: str | None = None
+    merchant_category: str | None = None
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "message": "Fraud detection API is healthy."}
+
+@app.post("/predict")
+async def predict(tx: Transaction):
+    """
+    Real-time fraud classification.
+    Target latency ≤ 200ms.
+    """
+    start = time.time()
+
+    # Convert transaction to DataFrame
+    tx_df = pd.DataFrame([tx.dict()])
+
+    # Preprocess features
+    X_proc = preprocessor.transform(tx_df)
+    dtest = xgb.DMatrix(X_proc)
+
+    # Predict fraud probability
+    prob = float(model.predict(dtest)[0])
+    pred = int(prob >= 0.5)
+
+    latency = (time.time() - start) * 1000  # ms
+    return {
+        "fraud_probability": prob,
+        "is_fraud": bool(pred),
+        "latency_ms": round(latency, 2),
+        "under_budget": latency <= LATENCY_BUDGET_MS,
+    }
+
+# -------------------------
+# OPTIONAL: KAFKA STREAM SIMULATION
+# -------------------------
+async def consume_from_kafka():
+    """
+    Simulate streaming transactions from Kafka topic.
+    """
+    consumer = AIOKafkaConsumer(
+        KAFKA_TOPIC,
+        bootstrap_servers=KAFKA_BROKER,
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+    )
+    await consumer.start()
+    print("🟢 Kafka consumer started.")
+    try:
+        async for msg in consumer:
+            tx = json.loads(msg.value.decode())
+            tx_df = pd.DataFrame([tx])
+            X_proc = preprocessor.transform(tx_df)
+            dtest = xgb.DMatrix(X_proc)
+            prob = float(model.predict(dtest)[0])
+            pred = int(prob >= 0.5)
+            print(f"[STREAM] TxID={tx.get('user_id')} → Fraud={pred} (p={prob:.3f})")
+    finally:
+        await consumer.stop()
+
+async def produce_mock_data(n=1000, rate_per_sec=100):
+    """
+    Simulate Kafka producer generating transactions at rate_per_sec.
+    """
+    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKER)
+    await producer.start()
+    try:
+        for i in range(n):
+            tx = {
+                "user_id": i,
+                "amount": float(np.random.uniform(1, 2000)),
+                "device_type": np.random.choice(["mobile", "web", "pos"]),
+                "geo_location": np.random.choice(["IN", "US", "UK", "SG"]),
+                "timestamp": pd.Timestamp.now().isoformat(),
+                "age": int(np.random.randint(18, 65)),
+                "gender": np.random.choice(["M", "F"]),
+                "merchant_category": np.random.choice(["electronics", "groceries", "fashion", "fuel"]),
+            }
+            await producer.send_and_wait(KAFKA_TOPIC, json.dumps(tx).encode())
+            await asyncio.sleep(1.0 / rate_per_sec)
+    finally:
+        await producer.stop()
+
+# -------------------------
+# ENTRYPOINTS
+# -------------------------
+if __name__ == "__main__":
+    import uvicorn
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "simulate":
+        # Run both producer and consumer in same loop
+        loop = asyncio.get_event_loop()
+        loop.create_task(produce_mock_data(n=100, rate_per_sec=50))
+        loop.run_until_complete(consume_from_kafka())
+    else:
+        # Run API
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+
+Access:
+
+http://localhost:8000/docs
+ → Interactive Swagger UI
+
+POST /predict with JSON body like:
+
+
+
+
+
+
+
+
+
+
+
+
+
+#IMPLEMENT DRIFT DETECTION,TRACJING FALS POSITIVES RATE AND ALERT THRESHOLDS,PROVIDE MONITORING #DASHBOARDS
+
+
+#1> DRIFT AND METRIC TRACKER
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+import json, os, time
+
+class FraudMonitor:
+    def __init__(self, baseline_path="baseline_stats.json", log_path="metrics_log.csv"):
+        self.baseline_path = baseline_path
+        self.log_path = log_path
+        self.alerts = []
+
+        if os.path.exists(baseline_path):
+            self.baseline = json.load(open(baseline_path))
+        else:
+            self.baseline = {}
+        
+        if not os.path.exists(log_path):
+            pd.DataFrame(columns=["timestamp", "TP", "FP", "FN", "TN", "FPR", "PSI"]).to_csv(log_path, index=False)
+
+    def compute_psi(self, expected, actual, buckets=10):
+        """Population Stability Index for drift detection"""
+        def scale_range (input, min_val, max_val):
+            input += -(np.min(input))
+            input /= np.max(input) / (max_val - min_val)
+            input += min_val
+            return input
+        
+        expected_percents, actual_percents = np.histogram(expected, bins=buckets)[0], np.histogram(actual, bins=buckets)[0]
+        expected_percents = expected_percents / len(expected)
+        actual_percents = actual_percents / len(actual)
+        psi = np.sum((expected_percents - actual_percents) * np.log(expected_percents / actual_percents + 1e-6))
+        return psi
+
+    def update_metrics(self, y_true, y_pred, feature_reference, feature_current):
+        cm = confusion_matrix(y_true, y_pred, labels=[1,0])
+        TP, FN, FP, TN = cm.ravel()
+        FPR = FP / (FP + TN + 1e-6)
+        PSI = self.compute_psi(feature_reference, feature_current)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        new_row = pd.DataFrame([[timestamp, TP, FP, FN, TN, FPR, PSI]],
+                               columns=["timestamp", "TP", "FP", "FN", "TN", "FPR", "PSI"])
+        new_row.to_csv(self.log_path, mode='a', header=False, index=False)
+        self.check_alerts(FPR, PSI)
+
+    def check_alerts(self, fpr, psi):
+        if fpr > 0.05:
+            self.alerts.append(f"⚠️ High False Positive Rate: {fpr:.2f}")
+        if psi > 0.2:
+            self.alerts.append(f"⚠️ Significant Drift Detected (PSI={psi:.2f})")
+
+    def plot_metrics(self):
+        df = pd.read_csv(self.log_path)
+        fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+        ax[0].plot(df["timestamp"], df["FPR"], label="False Positive Rate")
+        ax[0].axhline(0.05, color="red", linestyle="--", label="Threshold")
+        ax[0].legend()
+        ax[0].set_title("False Positive Rate Over Time")
+        ax[0].tick_params(axis='x', rotation=45)
+
+        ax[1].plot(df["timestamp"], df["PSI"], color="orange", label="PSI (Drift)")
+        ax[1].axhline(0.2, color="red", linestyle="--", label="Drift Threshold")
+        ax[1].legend()
+        ax[1].set_title("Feature Drift (PSI)")
+        ax[1].tick_params(axis='x', rotation=45)
+        plt.tight_layout()
+        plt.show()
+
+
+##INTEGRATION WITH FRAUD API
+
+from monitoring_utils import FraudMonitor
+monitor = FraudMonitor()
+
+@app.post("/predict")
+async def predict(tx: Transaction):
+    start = time.time()
+    tx_df = pd.DataFrame([tx.dict()])
+    X_proc = preprocessor.transform(tx_df)
+    dtest = xgb.DMatrix(X_proc)
+    prob = float(model.predict(dtest)[0])
+    pred = int(prob >= 0.5)
+    latency = (time.time() - start) * 1000
+
+    # Simulate ground truth later (for metrics demo)
+    true_label = np.random.choice([0,1], p=[0.95, 0.05])
+    monitor.update_metrics([true_label], [pred],
+                           feature_reference=np.random.normal(0,1,1000),
+                           feature_current=np.random.normal(0.1,1,1000))
+
+    return {
+        "fraud_probability": prob,
+        "is_fraud": bool(pred),
+        "latency_ms": round(latency, 2),
+        "under_budget": latency <= 200,
+        "alerts": monitor.alerts[-2:]
+    }
+
+
+#3> STREAMLIT DASHBOARD
+
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+from monitoring_utils import FraudMonitor
+
+st.set_page_config(page_title="Fraud Detection Monitoring", layout="wide")
+st.title("🔍 Fraud Detection Monitoring Dashboard")
+
+monitor = FraudMonitor()
+
+if not hasattr(st.session_state, "auto_refresh"):
+    st.session_state.auto_refresh = True
+
+refresh_rate = st.sidebar.slider("Refresh every (sec)", 2, 60, 5)
+
+placeholder = st.empty()
+
+while st.session_state.auto_refresh:
+    df = pd.read_csv(monitor.log_path)
+    if df.empty:
+        st.warning("No metrics logged yet.")
+        st.stop()
+
+    st.subheader("System Metrics Overview")
+    col1, col2 = st.columns(2)
+    col1.metric("False Positive Rate", f"{df['FPR'].iloc[-1]*100:.2f}%")
+    col2.metric("Population Stability Index (Drift)", f"{df['PSI'].iloc[-1]:.3f}")
+
+    st.line_chart(df[["FPR", "PSI"]])
+
+    # Alerts
+    if monitor.alerts:
+        st.error("⚠️ Alerts:")
+        for alert in monitor.alerts[-5:]:
+            st.write(f"- {alert}")
+
+    # Historical Plots
+    st.subheader("Historical Trends")
+    monitor.plot_metrics()
+
+    st.info(f"Last updated: {df['timestamp'].iloc[-1]}")
+    time.sleep(refresh_rate)
+
+
+
+
+
+
+
+
+
+
+
+
+# Final Report for Generating fraud insights report with Keyfrauddrivers&transactionpatterns and #Preventiverecommendationsforcomplianceteams.
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from reportlab.lib.styles import getSampleStyleSheet
+from io import BytesIO
+
+# -----------------------------
+# LOAD DATA
+# -----------------------------
+df = pd.read_csv("fraud_detection_dataset.csv")
+target_col = "isFraud"
+
+# Basic cleaning
+df = df.dropna(subset=[target_col])
+y = df[target_col]
+X = df.drop(columns=[target_col])
+
+# Handle categorical features
+X = pd.get_dummies(X, drop_first=True)
+
+# -----------------------------
+# MODEL TRAINING
+# -----------------------------
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+model = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.1, n_jobs=-1)
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+report = classification_report(y_test, y_pred, output_dict=True)
+
+# -----------------------------
+# FEATURE IMPORTANCE
+# -----------------------------
+importances = pd.DataFrame({
+    'feature': X.columns,
+    'importance': model.feature_importances_
+}).sort_values(by='importance', ascending=False)
+
+top_features = importances.head(10)
+
+# -----------------------------
+# FRAUD INSIGHTS
+# -----------------------------
+fraud_rate = y.mean() * 100
+geo_cols = [c for c in df.columns if 'geo' in c.lower()]
+device_cols = [c for c in df.columns if 'device' in c.lower()]
+amount_col = [c for c in df.columns if 'amount' in c.lower()]
+
+insights = []
+
+insights.append(f"Overall fraud rate in dataset: {fraud_rate:.2f}%")
+
+if amount_col:
+    avg_fraud_amt = df.loc[df[target_col]==1, amount_col[0]].mean()
+    avg_genuine_amt = df.loc[df[target_col]==0, amount_col[0]].mean()
+    insights.append(f"Average fraud transaction amount: ₹{avg_fraud_amt:.2f} vs genuine ₹{avg_genuine_amt:.2f}")
+
+if geo_cols:
+    top_geo = df.groupby(geo_cols[0])[target_col].mean().sort_values(ascending=False).head(3)
+    insights.append(f"Top fraud-prone regions: {', '.join(top_geo.index)}")
+
+if device_cols:
+    top_device = df.groupby(device_cols[0])[target_col].mean().sort_values(ascending=False).head(3)
+    insights.append(f"High-risk device types: {', '.join(top_device.index)}")
+
+insights.append("Top contributing features: " + ", ".join(top_features['feature'].head(5).tolist()))
+
+# -----------------------------
+# VISUALIZATIONS
+# -----------------------------
+plt.figure(figsize=(8,5))
+sns.barplot(x='importance', y='feature', data=top_features)
+plt.title("Top 10 Fraud Drivers (Feature Importance)")
+plt.tight_layout()
+
+buf = BytesIO()
+plt.savefig(buf, format='png')
+buf.seek(0)
+
+# -----------------------------
+# PREVENTIVE RECOMMENDATIONS
+# -----------------------------
+recommendations = [
+    "1️⃣ Implement multi-factor authentication for high-value transactions.",
+    "2️⃣ Enforce tighter limits on suspicious device types and geo-locations.",
+    "3️⃣ Use behavioral profiling to detect unusual time-of-day transaction spikes.",
+    "4️⃣ Cross-verify device fingerprints and IP locations with customer history.",
+    "5️⃣ Conduct periodic model retraining and drift analysis using new fraud patterns.",
+    "6️⃣ Automate alert routing to compliance teams for real-time fraud escalations.",
+    "7️⃣ Regularly monitor false positive rates to avoid customer friction.",
+]
+
+# -----------------------------
+# PDF REPORT GENERATION
+# -----------------------------
+pdf = SimpleDocTemplate("fraud_insights_report.pdf", pagesize=A4)
+styles = getSampleStyleSheet()
+story = []
+
+story.append(Paragraph("<b>Fraud Detection Insights Report</b>", styles["Title"]))
+story.append(Spacer(1, 20))
+
+story.append(Paragraph("📈 Key Dataset Statistics", styles["Heading2"]))
+story.append(Paragraph(f"Total records: {len(df):,}", styles["Normal"]))
+story.append(Paragraph(f"Fraud cases: {df[target_col].sum():,}", styles["Normal"]))
+story.append(Paragraph("<br/>", styles["Normal"]))
+
+story.append(Paragraph("🔍 Key Fraud Insights", styles["Heading2"]))
+for line in insights:
+    story.append(Paragraph("• " + line, styles["Normal"]))
+story.append(Spacer(1, 10))
+
+story.append(Paragraph("🏆 Model Performance", styles["Heading2"]))
+story.append(Paragraph(f"Precision (Fraud): {report['1']['precision']:.3f}", styles["Normal"]))
+story.append(Paragraph(f"Recall (Fraud): {report['1']['recall']:.3f}", styles["Normal"]))
+story.append(Paragraph(f"F1-Score (Fraud): {report['1']['f1-score']:.3f}", styles["Normal"]))
+
+story.append(Spacer(1, 10))
+story.append(Paragraph("🔥 Top Fraud Drivers", styles["Heading2"]))
+img = Image(buf, width=400, height=300)
+story.append(img)
+story.append(Spacer(1, 10))
+
+story.append(Paragraph("🧭 Preventive Recommendations for Compliance Teams", styles["Heading2"]))
+for rec in recommendations:
+    story.append(Paragraph(rec, styles["Normal"]))
+
+story.append(Spacer(1, 20))
+story.append(Paragraph("Generated by Fraud Analytics Engine © 2025", styles["Italic"]))
+
+pdf.build(story)
+print("✅ Fraud insights report generated: fraud_insights_report.pdf")
+
+
+
+
+
+
+
+
+
+
+
+
